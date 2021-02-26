@@ -65,6 +65,7 @@ type STSError struct {
 	Code           string
 	Description    string
 	HTTPStatusCode int
+	Key            string
 }
 
 // STSErrorResponse - error response format
