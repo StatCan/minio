@@ -8,8 +8,8 @@ ENV GO111MODULE on
 
 RUN  \
      apk add --no-cache git && \
-     git clone https://github.com/minio/minio && cd minio && \
-     git checkout master && go install -v -ldflags "$(go run buildscripts/gen-ldflags.go)"
+     git clone https://github.com/StatCan/minio && cd minio && \
+     git checkout stc-master && go install -v -ldflags "$(go run buildscripts/gen-ldflags.go)"
 
 FROM registry.access.redhat.com/ubi8/ubi-minimal:8.3
 
