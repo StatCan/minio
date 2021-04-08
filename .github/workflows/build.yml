@@ -24,9 +24,9 @@ jobs:
       run: |
         make all
         docker build . -t ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:$SHORT_SHA \
-          -t ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${GITHUB_REF#refs/*/}
+          -t ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${GITHUB_REF#refs/*/} --squash
         docker image prune
-        
+
     # Scan image for vulnerabilities
     - uses: Azure/container-scan@v0
       with:
