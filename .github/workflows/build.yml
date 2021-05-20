@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - stc-master
+      - squash-layers
 # Environment variables available to all jobs and steps in this workflow
 env:
   REGISTRY_NAME: k8scc01covidacr
@@ -23,6 +24,10 @@ jobs:
     - name: Build image
       run: |
         make all
+        cat etc/docker/daemon.json
+        sudo rm -rf /etc/docker/daemon.json
+        echo '{"experimental": true}' | sudo tee -a /etc/docker/daemon.json
+        sudo systemctl restart docker
         docker build . -t ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:$SHORT_SHA \
           -t ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${GITHUB_REF#refs/*/} --squash
         docker image prune
@@ -40,8 +45,8 @@ jobs:
         username: ${{ secrets.REGISTRY_USERNAME }}
         password: ${{ secrets.REGISTRY_PASSWORD }}
 
-    # Push image
-    - name: Docker push
-      run: |
-        docker push ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${{ env.SHORT_SHA }}
-        docker push ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${GITHUB_REF#refs/*/}
+    # # Push image
+    # - name: Docker push
+    #   run: |
+    #     docker push ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${{ env.SHORT_SHA }}
+    #     docker push ${{ env.REGISTRY_NAME }}.azurecr.io/minio/minio:${GITHUB_REF#refs/*/}
