@@ -24,7 +24,6 @@ jobs:
     - name: Build image
       run: |
         make all
-        cat etc/docker/daemon.json
         sudo rm -rf /etc/docker/daemon.json
         echo '{"experimental": true}' | sudo tee -a /etc/docker/daemon.json
         sudo systemctl restart docker
