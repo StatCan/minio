@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2018, 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -20,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,20 +31,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bits-and-blooms/bloom/v3"
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/compress/zip"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/cmd/crypto"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
-	bandwidth "github.com/minio/minio/pkg/bandwidth"
 	bucketBandwidth "github.com/minio/minio/pkg/bucket/bandwidth"
 	"github.com/minio/minio/pkg/bucket/policy"
 	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/madmin"
 	xnet "github.com/minio/minio/pkg/net"
 	"github.com/minio/minio/pkg/sync/errgroup"
-	"github.com/willf/bloom"
 )
 
 // NotificationSys - notification system.
@@ -354,7 +355,7 @@ func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io
 	}
 
 	// Local host
-	thisAddr, err := xnet.ParseHost(GetLocalPeer(globalEndpoints))
+	thisAddr, err := xnet.ParseHost(globalLocalNodeName)
 	if err != nil {
 		logger.LogIf(ctx, err)
 		return profilingDataFound
@@ -399,7 +400,7 @@ func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io
 }
 
 // ServerUpdate - updates remote peers.
-func (sys *NotificationSys) ServerUpdate(ctx context.Context, u *url.URL, sha256Sum []byte, lrTime time.Time) []NotificationPeerErr {
+func (sys *NotificationSys) ServerUpdate(ctx context.Context, u *url.URL, sha256Sum []byte, lrTime time.Time, releaseInfo string) []NotificationPeerErr {
 	ng := WithNPeers(len(sys.peerClients))
 	for idx, client := range sys.peerClients {
 		if client == nil {
@@ -407,7 +408,7 @@ func (sys *NotificationSys) ServerUpdate(ctx context.Context, u *url.URL, sha256
 		}
 		client := client
 		ng.Go(ctx, func() error {
-			return client.ServerUpdate(ctx, u, sha256Sum, lrTime)
+			return client.ServerUpdate(ctx, u, sha256Sum, lrTime, releaseInfo)
 		}, idx, *client.host)
 	}
 	return ng.Wait()
@@ -497,75 +498,6 @@ func (sys *NotificationSys) updateBloomFilter(ctx context.Context, current uint6
 	return bf, nil
 }
 
-// collectBloomFilter will collect bloom filters from all servers from the specified cycle.
-func (sys *NotificationSys) collectBloomFilter(ctx context.Context, from uint64) (*bloomFilter, error) {
-	var req = bloomFilterRequest{
-		Current: 0,
-		Oldest:  from,
-	}
-
-	// Load initial state from local...
-	var bf *bloomFilter
-	bfr, err := intDataUpdateTracker.cycleFilter(ctx, req)
-	logger.LogIf(ctx, err)
-	if err == nil && bfr.Complete {
-		nbf := intDataUpdateTracker.newBloomFilter()
-		bf = &nbf
-		_, err = bf.ReadFrom(bytes.NewReader(bfr.Filter))
-		logger.LogIf(ctx, err)
-	}
-	if !bfr.Complete {
-		// If local isn't complete just return early
-		return nil, nil
-	}
-
-	var mu sync.Mutex
-	g := errgroup.WithNErrs(len(sys.peerClients))
-	for idx, client := range sys.peerClients {
-		if client == nil {
-			continue
-		}
-		client := client
-		g.Go(func() error {
-			serverBF, err := client.cycleServerBloomFilter(ctx, req)
-			if false && intDataUpdateTracker.debug {
-				b, _ := json.MarshalIndent(serverBF, "", "  ")
-				logger.Info("Disk %v, Bloom filter: %v", client.host.Name, string(b))
-			}
-			// Keep lock while checking result.
-			mu.Lock()
-			defer mu.Unlock()
-
-			if err != nil || !serverBF.Complete || bf == nil {
-				logger.LogIf(ctx, err)
-				bf = nil
-				return nil
-			}
-
-			var tmp bloom.BloomFilter
-			_, err = tmp.ReadFrom(bytes.NewReader(serverBF.Filter))
-			if err != nil {
-				logger.LogIf(ctx, err)
-				bf = nil
-				return nil
-			}
-			if bf.BloomFilter == nil {
-				bf.BloomFilter = &tmp
-			} else {
-				err = bf.Merge(&tmp)
-				if err != nil {
-					logger.LogIf(ctx, err)
-					bf = nil
-					return nil
-				}
-			}
-			return nil
-		}, idx)
-	}
-	g.Wait()
-	return bf, nil
-}
-
 // findEarliestCleanBloomFilter will find the earliest bloom filter across the cluster
 // where the directory is clean.
 // Due to how objects are stored this can include object names.
@@ -615,6 +547,8 @@ func (sys *NotificationSys) findEarliestCleanBloomFilter(ctx context.Context, di
 	return best
 }
 
+var errPeerNotReachable = errors.New("peer is not reachable")
+
 // GetLocks - makes GetLocks RPC call on all peers.
 func (sys *NotificationSys) GetLocks(ctx context.Context, r *http.Request) []*PeerLocks {
 	locksResp := make([]*PeerLocks, len(sys.peerClients))
@@ -623,7 +557,7 @@ func (sys *NotificationSys) GetLocks(ctx context.Context, r *http.Request) []*Pe
 		index := index
 		g.Go(func() error {
 			if client == nil {
-				return nil
+				return errPeerNotReachable
 			}
 			serverLocksResp, err := sys.peerClients[index].GetLocks()
 			if err != nil {
@@ -671,6 +605,7 @@ func (sys *NotificationSys) LoadBucketMetadata(ctx context.Context, bucketName s
 
 // DeleteBucketMetadata - calls DeleteBucketMetadata call on all peers
 func (sys *NotificationSys) DeleteBucketMetadata(ctx context.Context, bucketName string) {
+	globalReplicationStats.Delete(bucketName)
 	globalBucketMetadataSys.Remove(bucketName)
 	if localMetacacheMgr != nil {
 		localMetacacheMgr.deleteBucketCache(bucketName)
@@ -684,6 +619,58 @@ func (sys *NotificationSys) DeleteBucketMetadata(ctx context.Context, bucketName
 		client := client
 		ng.Go(ctx, func() error {
 			return client.DeleteBucketMetadata(bucketName)
+		}, idx, *client.host)
+	}
+	for _, nErr := range ng.Wait() {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", nErr.Host.String())
+		if nErr.Err != nil {
+			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), nErr.Err)
+		}
+	}
+}
+
+// GetClusterBucketStats - calls GetClusterBucketStats call on all peers for a cluster statistics view.
+func (sys *NotificationSys) GetClusterBucketStats(ctx context.Context, bucketName string) []BucketStats {
+	ng := WithNPeers(len(sys.peerClients))
+	bucketStats := make([]BucketStats, len(sys.peerClients))
+	for index, client := range sys.peerClients {
+		index := index
+		client := client
+		ng.Go(ctx, func() error {
+			if client == nil {
+				return errPeerNotReachable
+			}
+			bs, err := client.GetBucketStats(bucketName)
+			if err != nil {
+				return err
+			}
+			bucketStats[index] = bs
+			return nil
+		}, index, *client.host)
+	}
+	for _, nErr := range ng.Wait() {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", nErr.Host.String())
+		if nErr.Err != nil {
+			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), nErr.Err)
+		}
+	}
+	bucketStats = append(bucketStats, BucketStats{
+		ReplicationStats: globalReplicationStats.Get(bucketName),
+	})
+	return bucketStats
+}
+
+// LoadTransitionTierConfig notifies remote peers to load their remote tier
+// configs from config store.
+func (sys *NotificationSys) LoadTransitionTierConfig(ctx context.Context) {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(ctx, func() error {
+			return client.LoadTransitionTierConfig(ctx)
 		}, idx, *client.host)
 	}
 	for _, nErr := range ng.Wait() {
@@ -889,7 +876,7 @@ func (sys *NotificationSys) NetInfo(ctx context.Context) madmin.ServerNetHealthI
 	}
 
 	for i := 0; i < len(sortedGlobalEndpoints); i++ {
-		if sortedGlobalEndpoints[i] != GetLocalPeer(globalEndpoints) {
+		if sortedGlobalEndpoints[i] != globalLocalNodeName {
 			continue
 		}
 		for j := 0; j < len(sortedGlobalEndpoints); j++ {
@@ -922,7 +909,7 @@ func (sys *NotificationSys) NetInfo(ctx context.Context) madmin.ServerNetHealthI
 	}
 	return madmin.ServerNetHealthInfo{
 		Net:  netInfos,
-		Addr: GetLocalPeer(globalEndpoints),
+		Addr: globalLocalNodeName,
 	}
 }
 
@@ -997,7 +984,7 @@ func (sys *NotificationSys) NetPerfParallelInfo(ctx context.Context) madmin.Serv
 	wg.Wait()
 	return madmin.ServerNetHealthInfo{
 		Net:  netInfos,
-		Addr: GetLocalPeer(globalEndpoints),
+		Addr: globalLocalNodeName,
 	}
 
 }
@@ -1368,7 +1355,7 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 		AwsRegion:         args.ReqParams["region"],
 		EventTime:         eventTime.Format(event.AMZTimeFormat),
 		EventName:         args.EventName,
-		UserIdentity:      event.Identity{PrincipalID: args.ReqParams["accessKey"]},
+		UserIdentity:      event.Identity{PrincipalID: args.ReqParams["principalId"]},
 		RequestParameters: args.ReqParams,
 		ResponseElements:  respElements,
 		S3: event.Metadata{
@@ -1376,7 +1363,7 @@ func (args eventArgs) ToEvent(escape bool) event.Event {
 			ConfigurationID: "Config",
 			Bucket: event.Bucket{
 				Name:          args.BucketName,
-				OwnerIdentity: event.Identity{PrincipalID: args.ReqParams["accessKey"]},
+				OwnerIdentity: event.Identity{PrincipalID: args.ReqParams["principalId"]},
 				ARN:           policy.ResourceARNPrefix + args.BucketName,
 			},
 			Object: event.Object{
@@ -1425,8 +1412,8 @@ func sendEvent(args eventArgs) {
 }
 
 // GetBandwidthReports - gets the bandwidth report from all nodes including self.
-func (sys *NotificationSys) GetBandwidthReports(ctx context.Context, buckets ...string) bandwidth.Report {
-	reports := make([]*bandwidth.Report, len(sys.peerClients))
+func (sys *NotificationSys) GetBandwidthReports(ctx context.Context, buckets ...string) madmin.BucketBandwidthReport {
+	reports := make([]*madmin.BucketBandwidthReport, len(sys.peerClients))
 	g := errgroup.WithNErrs(len(sys.peerClients))
 	for index := range sys.peerClients {
 		if sys.peerClients[index] == nil {
@@ -1447,8 +1434,8 @@ func (sys *NotificationSys) GetBandwidthReports(ctx context.Context, buckets ...
 		logger.LogOnceIf(ctx, err, sys.peerClients[index].host.String())
 	}
 	reports = append(reports, globalBucketMonitor.GetReport(bucketBandwidth.SelectBuckets(buckets...)))
-	consolidatedReport := bandwidth.Report{
-		BucketStats: make(map[string]bandwidth.Details),
+	consolidatedReport := madmin.BucketBandwidthReport{
+		BucketStats: make(map[string]madmin.BandwidthDetails),
 	}
 	for _, report := range reports {
 		if report == nil || report.BucketStats == nil {
@@ -1457,7 +1444,7 @@ func (sys *NotificationSys) GetBandwidthReports(ctx context.Context, buckets ...
 		for bucket := range report.BucketStats {
 			d, ok := consolidatedReport.BucketStats[bucket]
 			if !ok {
-				consolidatedReport.BucketStats[bucket] = bandwidth.Details{}
+				consolidatedReport.BucketStats[bucket] = madmin.BandwidthDetails{}
 				d = consolidatedReport.BucketStats[bucket]
 				d.LimitInBytesPerSecond = report.BucketStats[bucket].LimitInBytesPerSecond
 			}

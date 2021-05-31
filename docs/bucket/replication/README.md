@@ -2,6 +2,8 @@
 
 Bucket replication is designed to replicate selected objects in a bucket to a destination bucket.
 
+The contents of this page have been migrated to the new [MinIO Baremetal Documentation: Bucket Replication](https://docs.min.io/minio/baremetal/replication/replication-overview.html#) page. The [Bucket Replication](https://docs.min.io/minio/baremetal/replication/replication-overview.html#) section includes dedicated tutorials for configuring one-way "Active-Passive" and two-way "Active-Active" bucket replication. Please update your bookmarks to use the new MinIO documentation, as this legacy documentation will be deprecated and removed in the future.
+
 To replicate objects in a bucket to a destination bucket on a target site either in the same cluster or a different cluster, start by enabling [versioning](https://docs.minio.io/docs/minio-bucket-versioning-guide.html) for both source and destination buckets. Finally, the target site and the destination bucket need to be configured on the source MinIO server.
 
 ## Highlights
@@ -39,6 +41,7 @@ The following minimal permission policy is needed by admin user setting up repli
    "Effect": "Allow",
    "Action": [
     "s3:GetReplicationConfiguration",
+    "s3:PutReplicationConfiguration",
     "s3:ListBucket",
     "s3:ListBucketMultipartUploads",
     "s3:GetBucketLocation",
@@ -129,6 +132,11 @@ The replication configuration can now be added to the source bucket by applying 
       "Destination": {
         "Bucket": "arn:aws:s3:::destbucket",
         "StorageClass": "STANDARD"
+      },
+      "SourceSelectionCriteria": {
+        "ReplicaModifications": {
+          "Status": "Enabled"
+        }
       }
     }
   ]
@@ -147,6 +155,19 @@ To perform bi-directional replication, repeat the above process on the target si
 
 ![head](https://raw.githubusercontent.com/minio/minio/master/docs/bucket/replication/HEAD_bucket_replication.png)
 
+## Replica Modification sync
+If bi-directional replication is set up between two clusters, any metadata update on the REPLICA object is by default reflected back in the source object when `ReplicaModifications` status in the `SourceSelectionCriteria` is `Enabled`. In MinIO, this is enabled by default. If a metadata update is performed on the "REPLICA" object, its `X-Amz-Replication-Status` will change from `PENDING` to `COMPLETE` or `FAILED`, and the source object version will show `X-Amz-Replication-Status` of `REPLICA` once the replication operation is complete.
+
+The replication configuration in use on a bucket can be viewed using the `mc replicate export alias/bucket` command.
+
+To disable replica metadata modification syncing, use `mc replicate edit` with the --replicate flag.
+```
+$ mc replicate edit alias/bucket --id xyz.id --replicate "delete,delete-marker"
+```
+To re-enable replica metadata modification syncing,
+```
+$ mc replicate edit alias/bucket --id xyz.id --replicate "delete,delete-marker,replica-metadata-sync"
+```
 ## MinIO Extension
 ### Replicating Deletes
 
@@ -182,6 +203,6 @@ remote replication target using the `mc admin bucket remote add` command
 ```
 
 ## Explore Further
-- [MinIO Bucket Replication Design](https://raw.githubusercontent.com/minio/minio/master/docs/bucket/replication/DESIGN.md)
+- [MinIO Bucket Replication Design](https://github.com/minio/minio/blob/master/docs/bucket/replication/DESIGN.md)
 - [MinIO Bucket Versioning Implementation](https://docs.minio.io/docs/minio-bucket-versioning-guide.html)
 - [MinIO Client Quickstart Guide](https://docs.minio.io/docs/minio-client-quickstart-guide.html)

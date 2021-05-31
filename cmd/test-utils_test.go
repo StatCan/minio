@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2015, 2016, 2017, 2018 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -54,6 +55,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+
 	"github.com/gorilla/mux"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
 	"github.com/minio/minio-go/v7/pkg/signer"
@@ -76,16 +78,13 @@ func TestMain(m *testing.M) {
 		SecretKey: auth.DefaultSecretKey,
 	}
 
-	globalConfigEncrypted = true
-
 	// disable ENVs which interfere with tests.
 	for _, env := range []string{
-		crypto.EnvAutoEncryptionLegacy,
 		crypto.EnvKMSAutoEncryption,
 		config.EnvAccessKey,
-		config.EnvAccessKeyOld,
 		config.EnvSecretKey,
-		config.EnvSecretKeyOld,
+		config.EnvRootUser,
+		config.EnvRootPassword,
 	} {
 		os.Unsetenv(env)
 	}
@@ -233,13 +232,7 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 // Using this interface, functionalities to be used in tests can be
 // made generalized, and can be integrated in benchmarks/unit tests/go check suite tests.
 type TestErrHandler interface {
-	Log(args ...interface{})
-	Logf(format string, args ...interface{})
-	Error(args ...interface{})
-	Errorf(format string, args ...interface{})
-	Failed() bool
-	Fatal(args ...interface{})
-	Fatalf(format string, args ...interface{})
+	testing.TB
 }
 
 const (
@@ -356,6 +349,8 @@ func UnstartedTestServer(t TestErrHandler, instanceType string) TestServer {
 	newAllSubsystems()
 
 	initAllSubsystems(ctx, objLayer)
+
+	globalIAMSys.InitStore(objLayer)
 
 	return testServer
 }
@@ -1281,35 +1276,6 @@ func getRandomBucketName() string {
 
 }
 
-// NewEOFWriter returns a Writer that writes to w,
-// but returns EOF error after writing n bytes.
-func NewEOFWriter(w io.Writer, n int64) io.Writer {
-	return &EOFWriter{w, n}
-}
-
-type EOFWriter struct {
-	w io.Writer
-	n int64
-}
-
-// io.Writer implementation designed to error out with io.EOF after reading `n` bytes.
-func (t *EOFWriter) Write(p []byte) (n int, err error) {
-	if t.n <= 0 {
-		return -1, io.EOF
-	}
-	// real write
-	n = len(p)
-	if int64(n) > t.n {
-		n = int(t.n)
-	}
-	n, err = t.w.Write(p[0:n])
-	t.n -= int64(n)
-	if err == nil {
-		n = len(p)
-	}
-	return
-}
-
 // construct URL for http requests for bucket operations.
 func makeTestTargetURL(endPoint, bucketName, objectName string, queryValues url.Values) string {
 	urlStr := endPoint + SlashSeparator
@@ -1576,6 +1542,8 @@ func newTestObjectLayer(ctx context.Context, endpointServerPools EndpointServerP
 
 	initAllSubsystems(ctx, z)
 
+	globalIAMSys.InitStore(z)
+
 	return z, nil
 }
 
@@ -1621,6 +1589,8 @@ func initAPIHandlerTest(obj ObjectLayer, endpoints []string) (string, http.Handl
 	newAllSubsystems()
 
 	initAllSubsystems(context.Background(), obj)
+
+	globalIAMSys.InitStore(obj)
 
 	// get random bucket name.
 	bucketName := getRandomBucketName()
@@ -1914,6 +1884,8 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 
 	initAllSubsystems(ctx, objLayer)
 
+	globalIAMSys.InitStore(objLayer)
+
 	// Executing the object layer tests for single node setup.
 	objTest(objLayer, FSTestStr, t)
 
@@ -1932,6 +1904,8 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 	defer objLayer.Shutdown(context.Background())
 
 	initAllSubsystems(ctx, objLayer)
+
+	globalIAMSys.InitStore(objLayer)
 
 	defer removeRoots(append(fsDirs, fsDir))
 	// Executing the object layer tests for Erasure.

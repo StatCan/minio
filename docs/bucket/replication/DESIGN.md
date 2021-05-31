@@ -16,7 +16,7 @@ If synchronous replication is configured above, replication is attempted right a
 
 Any metadata changes on the source object version, such as metadata updates via PutObjectTagging, PutObjectRetention, PutObjectLegalHold and COPY api are replicated in a similar manner to target version, with the `X-Amz-Replication-Status` again cycling through the same states.
 
-The description above details one way replication from source to target w.r.t incoming object uploads and metadata changes to source object version. If active-active replication is configured, any incoming uploads and metadata changes to versions created on the target, will sync back to the source and be marked as `REPLICA` on the source. AWS, as well as MinIO do not by default sync metadata changes on a object version marked `REPLICA` back to source. This requires a setting in the replication configuration called [replica modification sync](https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-replication-adds-support-two-way-replication/) which is not yet available in MinIO.
+The description above details one way replication from source to target w.r.t incoming object uploads and metadata changes to source object version. If active-active replication is configured, any incoming uploads and metadata changes to versions created on the target, will sync back to the source and be marked as `REPLICA` on the source. AWS, as well as MinIO do not by default sync metadata changes on a object version marked `REPLICA` back to source. This requires a setting in the replication configuration called [replica modification sync](https://aws.amazon.com/about-aws/whats-new/2020/12/amazon-s3-replication-adds-support-two-way-replication/).
 
 For active-active replication, automatic failover occurs on `GET/HEAD` operations if object or object version requested qualifies for replication and is missing on one site, but present on the other. This allows the applications to take full advantage of two-way replication even before the two sites get fully synced.
 
@@ -31,11 +31,13 @@ It must be noted that if active-active replication is set up with delete marker 
 In the case of versioned deletes a.k.a permanent delete of a version by doing a `mc rm --version-id` on a object, replication implementation marks a object version permanently deleted as `PENDING` purge and deletes the version from source after syncing to the target and ensuring target version is deleted. The delete marker being deleted or object version being deleted will still be visible on listing with `mc ls --versions` until the sync is completed. Objects marked as deleted will not be accessible via `GET` or `HEAD` requests and would return a http response code of `405`. The status of versioned delete replication on the source can be queried by `HEAD` request on the delete marker versionID or object versionID in question.
 An additional header `X-Minio-Replication-Delete-Status` is returned which would show `PENDING` or `FAILED` status if the replication is still not caught up.
 
+Note that synchronous replication, i.e. when remote target is configured with --sync mode in `mc admin bucket remote add` does not apply to `DELETE` operations. The version being deleted on the source cluster needs to maintain state and ensure that the operation is mirrored to the target cluster prior to completing on the source object version. Since this needs to account for the target cluster availability and the need to serialize concurrent DELETE operations on different versions of the same object during multi DELETE operations, the current implementation queues the `DELETE` operations in both sync and async modes.
+
 Existing object replication, replica modification sync for 2-way replication and multi site replication are currently not supported.
 
 ### Internal metadata for replication
 
-`xl.meta` that is in use for [versioning](https://raw.githubusercontent.com/minio/minio/master/docs/bucket/versioning/DESIGN.md) has additional metadata for replication of objects,delete markers and versioned deletes.
+`xl.meta` that is in use for [versioning](https://github.com/minio/minio/blob/master/docs/bucket/versioning/DESIGN.md) has additional metadata for replication of objects,delete markers and versioned deletes.
 
 ### Metadata for object replication
 

@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2020 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -156,21 +157,16 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 			if !o.IncludeDirectories && entry.isDir() {
 				continue
 			}
-			o.debugln("gather got:", entry.name)
 			if o.Marker != "" && entry.name < o.Marker {
-				o.debugln("pre marker")
 				continue
 			}
 			if !strings.HasPrefix(entry.name, o.Prefix) {
-				o.debugln("not in prefix")
 				continue
 			}
 			if !o.Recursive && !entry.isInDir(o.Prefix, o.Separator) {
-				o.debugln("not in dir", o.Prefix, o.Separator)
 				continue
 			}
 			if !o.InclDeleted && entry.isObject() && entry.isLatestDeletemarker() {
-				o.debugln("latest is delete marker")
 				continue
 			}
 			if o.Limit > 0 && results.len() >= o.Limit {
@@ -183,7 +179,6 @@ func (o *listPathOptions) gatherResults(in <-chan metaCacheEntry) func() (metaCa
 				}
 				continue
 			}
-			o.debugln("adding...")
 			results.o = append(results.o, entry)
 		}
 		if resCh != nil {
@@ -423,11 +418,6 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 
 		// We got a stream to start at.
 		loadedPart := 0
-		buf := bufferPool.Get().(*bytes.Buffer)
-		defer func() {
-			buf.Reset()
-			bufferPool.Put(buf)
-		}()
 		for {
 			select {
 			case <-ctx.Done():
@@ -476,9 +466,27 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 					}
 				}
 			}
-			buf.Reset()
-			err := er.getObjectWithFileInfo(ctx, minioMetaBucket, o.objectPath(partN), 0, fi.Size, buf, fi, metaArr, onlineDisks)
-			if err != nil {
+
+			pr, pw := io.Pipe()
+			go func() {
+				werr := er.getObjectWithFileInfo(ctx, minioMetaBucket, o.objectPath(partN), 0,
+					fi.Size, pw, fi, metaArr, onlineDisks)
+				pw.CloseWithError(werr)
+			}()
+
+			tmp := newMetacacheReader(pr)
+			e, err := tmp.filter(o)
+			pr.CloseWithError(err)
+			entries.o = append(entries.o, e.o...)
+			if o.Limit > 0 && entries.len() > o.Limit {
+				entries.truncate(o.Limit)
+				return entries, nil
+			}
+			if err == nil {
+				// We stopped within the listing, we are done for now...
+				return entries, nil
+			}
+			if err != nil && err.Error() != io.EOF.Error() {
 				switch toObjectErr(err, minioMetaBucket, o.objectPath(partN)).(type) {
 				case ObjectNotFound:
 					retries++
@@ -492,24 +500,6 @@ func (er *erasureObjects) streamMetadataParts(ctx context.Context, o listPathOpt
 					logger.LogIf(ctx, err)
 					return entries, err
 				}
-			}
-			tmp, err := newMetacacheReader(buf)
-			if err != nil {
-				return entries, err
-			}
-			e, err := tmp.filter(o)
-			entries.o = append(entries.o, e.o...)
-			if o.Limit > 0 && entries.len() > o.Limit {
-				entries.truncate(o.Limit)
-				return entries, nil
-			}
-			if err == nil {
-				// We stopped within the listing, we are done for now...
-				return entries, nil
-			}
-			if !errors.Is(err, io.EOF) {
-				logger.LogIf(ctx, err)
-				return entries, err
 			}
 
 			// We finished at the end of the block.
@@ -686,7 +676,14 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions) (entr
 				// Update block 0 metadata.
 				var retries int
 				for {
-					err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), b.headerKV(), ObjectOptions{})
+					meta := b.headerKV()
+					fi := FileInfo{
+						Metadata: make(map[string]string, len(meta)),
+					}
+					for k, v := range meta {
+						fi.Metadata[k] = v
+					}
+					err := er.updateObjectMeta(ctx, minioMetaBucket, o.objectPath(0), fi)
 					if err == nil {
 						break
 					}
@@ -811,16 +808,20 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 	if len(disks) == 0 {
 		return fmt.Errorf("listPathRaw: 0 drives provided")
 	}
+	// Cancel upstream if we finish before we expect.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	askDisks := len(disks)
 	readers := make([]*metacacheReader, askDisks)
 	for i := range disks {
 		r, w := io.Pipe()
+		// Make sure we close the pipe so blocked writes doesn't stay around.
+		defer r.CloseWithError(context.Canceled)
+
+		readers[i] = newMetacacheReader(r)
 		d := disks[i]
-		readers[i], err = newMetacacheReader(r)
-		if err != nil {
-			return err
-		}
+
 		// Send request to each disk.
 		go func() {
 			werr := d.WalkDir(ctx, WalkDirOptions{
@@ -832,7 +833,10 @@ func listPathRaw(ctx context.Context, opts listPathRawOptions) (err error) {
 				ForwardTo:      opts.forwardTo,
 			}, w)
 			w.CloseWithError(werr)
-			if werr != io.EOF && werr != nil && werr.Error() != errFileNotFound.Error() && werr.Error() != errVolumeNotFound.Error() {
+			if werr != io.EOF && werr != nil &&
+				werr.Error() != errFileNotFound.Error() &&
+				werr.Error() != errVolumeNotFound.Error() &&
+				!errors.Is(werr, context.Canceled) {
 				logger.LogIf(ctx, werr)
 			}
 		}()

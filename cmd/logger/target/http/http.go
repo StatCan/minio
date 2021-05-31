@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2018, 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package http
 
@@ -29,6 +30,9 @@ import (
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 )
+
+// Timeout for the webhook http call
+const webhookCallTimeout = 5 * time.Second
 
 // Target implements logger.Target and sends the json
 // format of a log entry to the configured http endpoint.
@@ -61,7 +65,7 @@ func (h *Target) String() string {
 
 // Validate validate the http target
 func (h *Target) Validate() error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*webhookCallTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpoint, strings.NewReader(`{}`))
@@ -110,7 +114,7 @@ func (h *Target) startHTTPLogger() {
 				continue
 			}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), webhookCallTimeout)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 				h.endpoint, bytes.NewReader(logJSON))
 			if err != nil {
@@ -130,8 +134,8 @@ func (h *Target) startHTTPLogger() {
 			resp, err := h.client.Do(req)
 			cancel()
 			if err != nil {
-				logger.LogIf(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration\n",
-					h.endpoint, err))
+				logger.LogOnceIf(ctx, fmt.Errorf("%s returned '%w', please check your endpoint configuration",
+					h.endpoint, err), h.endpoint)
 				continue
 			}
 
@@ -141,11 +145,11 @@ func (h *Target) startHTTPLogger() {
 			if resp.StatusCode != http.StatusOK {
 				switch resp.StatusCode {
 				case http.StatusForbidden:
-					logger.LogIf(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set",
-						h.endpoint, resp.Status))
+					logger.LogOnceIf(ctx, fmt.Errorf("%s returned '%s', please check if your auth token is correctly set",
+						h.endpoint, resp.Status), h.endpoint)
 				default:
-					logger.LogIf(ctx, fmt.Errorf("%s returned '%s', please check your endpoint configuration",
-						h.endpoint, resp.Status))
+					logger.LogOnceIf(ctx, fmt.Errorf("%s returned '%s', please check your endpoint configuration",
+						h.endpoint, resp.Status), h.endpoint)
 				}
 			}
 		}

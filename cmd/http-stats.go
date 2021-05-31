@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2017 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -137,10 +138,15 @@ func (stats *HTTPAPIStats) Load() map[string]int {
 // HTTPStats holds statistics information about
 // HTTP requests made by all clients
 type HTTPStats struct {
-	s3RequestsInQueue int32
-	currentS3Requests HTTPAPIStats
-	totalS3Requests   HTTPAPIStats
-	totalS3Errors     HTTPAPIStats
+	s3RequestsInQueue       int32
+	currentS3Requests       HTTPAPIStats
+	totalS3Requests         HTTPAPIStats
+	totalS3Errors           HTTPAPIStats
+	totalS3Canceled         HTTPAPIStats
+	rejectedRequestsAuth    uint64
+	rejectedRequestsTime    uint64
+	rejectedRequestsHeader  uint64
+	rejectedRequestsInvalid uint64
 }
 
 func (st *HTTPStats) addRequestsInQueue(i int32) {
@@ -151,6 +157,10 @@ func (st *HTTPStats) addRequestsInQueue(i int32) {
 func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 	serverStats := ServerHTTPStats{}
 	serverStats.S3RequestsInQueue = atomic.LoadInt32(&st.s3RequestsInQueue)
+	serverStats.TotalS3RejectedAuth = atomic.LoadUint64(&st.rejectedRequestsAuth)
+	serverStats.TotalS3RejectedTime = atomic.LoadUint64(&st.rejectedRequestsTime)
+	serverStats.TotalS3RejectedHeader = atomic.LoadUint64(&st.rejectedRequestsHeader)
+	serverStats.TotalS3RejectedInvalid = atomic.LoadUint64(&st.rejectedRequestsInvalid)
 	serverStats.CurrentS3Requests = ServerHTTPAPIStats{
 		APIStats: st.currentS3Requests.Load(),
 	}
@@ -159,6 +169,9 @@ func (st *HTTPStats) toServerHTTPStats() ServerHTTPStats {
 	}
 	serverStats.TotalS3Errors = ServerHTTPAPIStats{
 		APIStats: st.totalS3Errors.Load(),
+	}
+	serverStats.TotalS3Canceled = ServerHTTPAPIStats{
+		APIStats: st.totalS3Canceled.Load(),
 	}
 	return serverStats
 }
@@ -172,8 +185,15 @@ func (st *HTTPStats) updateStats(api string, r *http.Request, w *logger.Response
 		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2ClusterPath) ||
 		!strings.HasSuffix(r.URL.Path, prometheusMetricsV2NodePath) {
 		st.totalS3Requests.Inc(api)
-		if !successReq && w.StatusCode != 0 {
-			st.totalS3Errors.Inc(api)
+		if !successReq {
+			switch w.StatusCode {
+			case 0:
+			case 499:
+				// 499 is a good error, shall be counted at canceled.
+				st.totalS3Canceled.Inc(api)
+			default:
+				st.totalS3Errors.Inc(api)
+			}
 		}
 	}
 

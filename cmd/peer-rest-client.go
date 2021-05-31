@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -32,15 +33,13 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio/cmd/http"
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/cmd/rest"
-	"github.com/minio/minio/pkg/bandwidth"
 	"github.com/minio/minio/pkg/event"
-	"github.com/minio/minio/pkg/madmin"
 	xnet "github.com/minio/minio/pkg/net"
-	"github.com/minio/minio/pkg/trace"
 	"github.com/tinylib/msgp/msgp"
 )
 
@@ -434,6 +433,20 @@ func (client *peerRESTClient) DownloadProfileData() (data map[string][]byte, err
 	return data, err
 }
 
+// GetBucketStats - load bucket statistics
+func (client *peerRESTClient) GetBucketStats(bucket string) (BucketStats, error) {
+	values := make(url.Values)
+	values.Set(peerRESTBucket, bucket)
+	respBody, err := client.call(peerRESTMethodGetBucketStats, values, nil, -1)
+	if err != nil {
+		return BucketStats{}, err
+	}
+
+	var bs BucketStats
+	defer http.DrainBody(respBody)
+	return bs, msgp.Decode(respBody, &bs)
+}
+
 // LoadBucketMetadata - load bucket metadata
 func (client *peerRESTClient) LoadBucketMetadata(bucket string) error {
 	values := make(url.Values)
@@ -585,19 +598,21 @@ func (client *peerRESTClient) LoadGroup(group string) error {
 }
 
 type serverUpdateInfo struct {
-	URL       *url.URL
-	Sha256Sum []byte
-	Time      time.Time
+	URL         *url.URL
+	Sha256Sum   []byte
+	Time        time.Time
+	ReleaseInfo string
 }
 
 // ServerUpdate - sends server update message to remote peers.
-func (client *peerRESTClient) ServerUpdate(ctx context.Context, u *url.URL, sha256Sum []byte, lrTime time.Time) error {
+func (client *peerRESTClient) ServerUpdate(ctx context.Context, u *url.URL, sha256Sum []byte, lrTime time.Time, releaseInfo string) error {
 	values := make(url.Values)
 	var reader bytes.Buffer
 	if err := gob.NewEncoder(&reader).Encode(serverUpdateInfo{
-		URL:       u,
-		Sha256Sum: sha256Sum,
-		Time:      lrTime,
+		URL:         u,
+		Sha256Sum:   sha256Sum,
+		Time:        lrTime,
+		ReleaseInfo: releaseInfo,
 	}); err != nil {
 		return err
 	}
@@ -682,10 +697,24 @@ func (client *peerRESTClient) UpdateMetacacheListing(ctx context.Context, m meta
 
 }
 
-func (client *peerRESTClient) doTrace(traceCh chan interface{}, doneCh <-chan struct{}, trcAll, trcErr bool) {
+func (client *peerRESTClient) LoadTransitionTierConfig(ctx context.Context) error {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadTransitionTierConfig, nil, nil, 0)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
+}
+
+func (client *peerRESTClient) doTrace(traceCh chan interface{}, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
 	values := make(url.Values)
-	values.Set(peerRESTTraceAll, strconv.FormatBool(trcAll))
-	values.Set(peerRESTTraceErr, strconv.FormatBool(trcErr))
+	values.Set(peerRESTTraceErr, strconv.FormatBool(traceOpts.OnlyErrors))
+	values.Set(peerRESTTraceS3, strconv.FormatBool(traceOpts.S3))
+	values.Set(peerRESTTraceStorage, strconv.FormatBool(traceOpts.Storage))
+	values.Set(peerRESTTraceOS, strconv.FormatBool(traceOpts.OS))
+	values.Set(peerRESTTraceInternal, strconv.FormatBool(traceOpts.Internal))
+	values.Set(peerRESTTraceThreshold, traceOpts.Threshold.String())
 
 	// To cancel the REST request in case doneCh gets closed.
 	ctx, cancel := context.WithCancel(GlobalContext)
@@ -710,7 +739,7 @@ func (client *peerRESTClient) doTrace(traceCh chan interface{}, doneCh <-chan st
 
 	dec := gob.NewDecoder(respBody)
 	for {
-		var info trace.Info
+		var info madmin.TraceInfo
 		if err = dec.Decode(&info); err != nil {
 			return
 		}
@@ -779,10 +808,10 @@ func (client *peerRESTClient) Listen(listenCh chan interface{}, doneCh <-chan st
 }
 
 // Trace - send http trace request to peer nodes
-func (client *peerRESTClient) Trace(traceCh chan interface{}, doneCh <-chan struct{}, trcAll, trcErr bool) {
+func (client *peerRESTClient) Trace(traceCh chan interface{}, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
 	go func() {
 		for {
-			client.doTrace(traceCh, doneCh, trcAll, trcErr)
+			client.doTrace(traceCh, doneCh, traceOpts)
 			select {
 			case <-doneCh:
 				return
@@ -892,7 +921,7 @@ func newPeerRESTClient(peer *xnet.Host) *peerRESTClient {
 }
 
 // MonitorBandwidth - send http trace request to peer nodes
-func (client *peerRESTClient) MonitorBandwidth(ctx context.Context, buckets []string) (*bandwidth.Report, error) {
+func (client *peerRESTClient) MonitorBandwidth(ctx context.Context, buckets []string) (*madmin.BucketBandwidthReport, error) {
 	values := make(url.Values)
 	values.Set(peerRESTBuckets, strings.Join(buckets, ","))
 	respBody, err := client.callWithContext(ctx, peerRESTMethodGetBandwidth, values, nil, -1)
@@ -902,7 +931,7 @@ func (client *peerRESTClient) MonitorBandwidth(ctx context.Context, buckets []st
 	defer http.DrainBody(respBody)
 
 	dec := gob.NewDecoder(respBody)
-	var bandwidthReport bandwidth.Report
+	var bandwidthReport madmin.BucketBandwidthReport
 	err = dec.Decode(&bandwidthReport)
 	return &bandwidthReport, err
 }

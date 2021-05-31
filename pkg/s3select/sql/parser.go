@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package sql
 
@@ -106,10 +107,10 @@ type TableExpression struct {
 
 // JSONPathElement represents a keypath component
 type JSONPathElement struct {
-	Key            *ObjectKey `parser:"  @@"`                  // ['name'] and .name forms
-	Index          *int       `parser:"| \"[\" @Number \"]\""` // [3] form
-	ObjectWildcard bool       `parser:"| @\".*\""`             // .* form
-	ArrayWildcard  bool       `parser:"| @\"[*]\""`            // [*] form
+	Key            *ObjectKey `parser:"  @@"`               // ['name'] and .name forms
+	Index          *int       `parser:"| \"[\" @Int \"]\""` // [3] form
+	ObjectWildcard bool       `parser:"| @\".*\""`          // .* form
+	ArrayWildcard  bool       `parser:"| @\"[*]\""`         // [*] form
 }
 
 // JSONPath represents a keypath.
@@ -119,7 +120,9 @@ type JSONPath struct {
 	PathExpr []*JSONPathElement `parser:"(@@)*"`
 
 	// Cached values:
-	pathString string
+	pathString         string
+	strippedTableAlias string
+	strippedPathExpr   []*JSONPathElement
 }
 
 // AliasedExpression is an expression that can be optionally named
@@ -333,7 +336,8 @@ type DateDiffFunc struct {
 
 // LitValue represents a literal value parsed from the sql
 type LitValue struct {
-	Number  *float64       `parser:"(  @Number"`
+	Float   *float64       `parser:"(  @Float"`
+	Int     *float64       `parser:" | @Int"` // To avoid value out of range, use float64 instead
 	String  *LiteralString `parser:" | @LitString"`
 	Boolean *Boolean       `parser:" | @(\"TRUE\" | \"FALSE\")"`
 	Null    bool           `parser:" | @\"NULL\")"`
@@ -351,7 +355,8 @@ var (
 		`|(?P<Keyword>(?i)\b(?:SELECT|FROM|TOP|DISTINCT|ALL|WHERE|GROUP|BY|HAVING|UNION|MINUS|EXCEPT|INTERSECT|ORDER|LIMIT|OFFSET|TRUE|FALSE|NULL|IS|NOT|ANY|SOME|BETWEEN|AND|OR|LIKE|ESCAPE|AS|IN|BOOL|INT|INTEGER|STRING|FLOAT|DECIMAL|NUMERIC|TIMESTAMP|AVG|COUNT|MAX|MIN|SUM|COALESCE|NULLIF|CAST|DATE_ADD|DATE_DIFF|EXTRACT|TO_STRING|TO_TIMESTAMP|UTCNOW|CHAR_LENGTH|CHARACTER_LENGTH|LOWER|SUBSTRING|TRIM|UPPER|LEADING|TRAILING|BOTH|FOR)\b)` +
 		`|(?P<Ident>[a-zA-Z_][a-zA-Z0-9_]*)` +
 		`|(?P<QuotIdent>"([^"]*("")?)*")` +
-		`|(?P<Number>\d*\.?\d+([eE][-+]?\d+)?)` +
+		`|(?P<Float>\d*\.\d+([eE][-+]?\d+)?)` +
+		`|(?P<Int>\d+)` +
 		`|(?P<LitString>'([^']*('')?)*')` +
 		`|(?P<Operators><>|!=|<=|>=|\.\*|\[\*\]|[-+*/%,.()=<>\[\]])`,
 	))

@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package s3select
 
@@ -216,6 +217,7 @@ type S3Select struct {
 	statement      *sql.SelectStatement
 	progressReader *progressReader
 	recordReader   recordReader
+	close          func() error
 }
 
 var (
@@ -311,6 +313,7 @@ func (s3Select *S3Select) Open(getReader func(offset, length int64) (io.ReadClos
 			}
 			return err
 		}
+		s3Select.close = rc.Close
 		return nil
 	case jsonFormat:
 		rc, err := getReader(0, -1)
@@ -333,6 +336,8 @@ func (s3Select *S3Select) Open(getReader func(offset, length int64) (io.ReadClos
 		} else {
 			s3Select.recordReader = json.NewReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
 		}
+
+		s3Select.close = rc.Close
 		return nil
 	case parquetFormat:
 		if !strings.EqualFold(os.Getenv("MINIO_API_SELECT_PARQUET"), "on") {
@@ -396,6 +401,12 @@ func (s3Select *S3Select) marshal(buf *bytes.Buffer, record sql.Record) error {
 
 // Evaluate - filters and sends records read from opened reader as per select statement to http response writer.
 func (s3Select *S3Select) Evaluate(w http.ResponseWriter) {
+	defer func() {
+		if s3Select.close != nil {
+			s3Select.close()
+		}
+	}()
+
 	getProgressFunc := s3Select.getProgress
 	if !s3Select.Progress.Enabled {
 		getProgressFunc = nil

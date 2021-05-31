@@ -1,18 +1,19 @@
-/*
- * MinIO Cloud Storage, (C) 2018-2019 MinIO, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+// Copyright (c) 2015-2021 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 package cmd
 
@@ -31,23 +32,21 @@ import (
 	"github.com/dchest/siphash"
 	"github.com/dustin/go-humanize"
 	"github.com/google/uuid"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/bpool"
 	"github.com/minio/minio/pkg/console"
 	"github.com/minio/minio/pkg/dsync"
-	"github.com/minio/minio/pkg/madmin"
+	"github.com/minio/minio/pkg/env"
 	"github.com/minio/minio/pkg/sync/errgroup"
 )
 
 // setsDsyncLockers is encapsulated type for Close()
 type setsDsyncLockers [][]dsync.NetLocker
 
-// Information of a new disk connection
-type diskConnectInfo struct {
-	setIndex int
-}
+const envMinioDeleteCleanupInterval = "MINIO_DELETE_CLEANUP_INTERVAL"
 
 // erasureSets implements ObjectLayer combining a static list of erasure coded
 // object sets. NOTE: There is no dynamic scaling allowed or intended in
@@ -86,7 +85,9 @@ type erasureSets struct {
 
 	poolIndex int
 
-	disksConnectEvent chan diskConnectInfo
+	// A channel to send the set index to the MRF when
+	// any disk belonging to that set is connected
+	setReconnectEvent chan int
 
 	// Distribution algorithm of choice.
 	distributionAlgo string
@@ -94,16 +95,24 @@ type erasureSets struct {
 
 	disksStorageInfoCache timedValue
 
-	mrfMU         sync.Mutex
-	mrfOperations map[healSource]int
+	mrfMU                  sync.Mutex
+	mrfOperations          map[healSource]int
+	lastConnectDisksOpTime time.Time
 }
 
-func isEndpointConnected(diskMap map[string]StorageAPI, endpoint string) bool {
+// Return false if endpoint is not connected or has been reconnected after last check
+func isEndpointConnectionStable(diskMap map[string]StorageAPI, endpoint string, lastCheck time.Time) bool {
 	disk := diskMap[endpoint]
 	if disk == nil {
 		return false
 	}
-	return disk.IsOnline()
+	if !disk.IsOnline() {
+		return false
+	}
+	if disk.LastConn().After(lastCheck) {
+		return false
+	}
+	return true
 }
 
 func (s *erasureSets) getDiskMap() map[string]StorageAPI {
@@ -195,14 +204,19 @@ func findDiskIndex(refFormat, format *formatErasureV3) (int, int, error) {
 // connectDisks - attempt to connect all the endpoints, loads format
 // and re-arranges the disks in proper position.
 func (s *erasureSets) connectDisks() {
+	defer func() {
+		s.lastConnectDisksOpTime = time.Now()
+	}()
+
 	var wg sync.WaitGroup
+	var setsJustConnected = make([]bool, s.setCount)
 	diskMap := s.getDiskMap()
 	for _, endpoint := range s.endpoints {
 		diskPath := endpoint.String()
 		if endpoint.IsLocal {
 			diskPath = endpoint.Path
 		}
-		if isEndpointConnected(diskMap, diskPath) {
+		if isEndpointConnectionStable(diskMap, diskPath, s.lastConnectDisksOpTime) {
 			continue
 		}
 		wg.Add(1)
@@ -249,20 +263,30 @@ func (s *erasureSets) connectDisks() {
 			}
 			disk.SetDiskLoc(s.poolIndex, setIndex, diskIndex)
 			s.endpointStrings[setIndex*s.setDriveCount+diskIndex] = disk.String()
+			setsJustConnected[setIndex] = true
 			s.erasureDisksMu.Unlock()
-			go func(setIndex int) {
-				idler := time.NewTimer(100 * time.Millisecond)
-				defer idler.Stop()
-
-				// Send a new disk connect event with a timeout
-				select {
-				case s.disksConnectEvent <- diskConnectInfo{setIndex: setIndex}:
-				case <-idler.C:
-				}
-			}(setIndex)
 		}(endpoint)
 	}
+
 	wg.Wait()
+
+	go func() {
+		idler := time.NewTimer(100 * time.Millisecond)
+		defer idler.Stop()
+
+		for setIndex, justConnected := range setsJustConnected {
+			if !justConnected {
+				continue
+			}
+
+			// Send a new set connect event with a timeout
+			idler.Reset(100 * time.Millisecond)
+			select {
+			case s.setReconnectEvent <- setIndex:
+			case <-idler.C:
+			}
+		}
+	}()
 }
 
 // monitorAndConnectEndpoints this is a monitoring loop to keep track of disconnected
@@ -344,14 +368,14 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 		sets:               make([]*erasureObjects, setCount),
 		erasureDisks:       make([][]StorageAPI, setCount),
 		erasureLockers:     make([][]dsync.NetLocker, setCount),
-		erasureLockOwner:   GetLocalPeer(globalEndpoints),
+		erasureLockOwner:   globalLocalNodeName,
 		endpoints:          endpoints,
 		endpointStrings:    endpointStrings,
 		setCount:           setCount,
 		setDriveCount:      setDriveCount,
 		defaultParityCount: defaultParityCount,
 		format:             format,
-		disksConnectEvent:  make(chan diskConnectInfo),
+		setReconnectEvent:  make(chan int),
 		distributionAlgo:   format.Erasure.DistributionAlgo,
 		deploymentID:       uuid.MustParse(format.ID),
 		mrfOperations:      make(map[healSource]int),
@@ -413,15 +437,20 @@ func newErasureSets(ctx context.Context, endpoints Endpoints, storageDisks []Sto
 			getDisks:              s.GetDisks(i),
 			getLockers:            s.GetLockers(i),
 			getEndpoints:          s.GetEndpoints(i),
-			deletedCleanupSleeper: newDynamicSleeper(10, 10*time.Second),
+			deletedCleanupSleeper: newDynamicSleeper(10, 2*time.Second),
 			nsMutex:               mutex,
 			bp:                    bp,
 			mrfOpCh:               make(chan partialOperation, 10000),
 		}
 	}
 
-	// cleanup ".trash/" folder every 30 minutes with sufficient sleep cycles.
-	const deletedObjectsCleanupInterval = 10 * time.Minute
+	// cleanup ".trash/" folder every 5m minutes with sufficient sleep cycles, between each
+	// deletes a dynamic sleeper is used with a factor of 10 ratio with max delay between
+	// deletes to be 2 seconds.
+	deletedObjectsCleanupInterval, err := time.ParseDuration(env.Get(envMinioDeleteCleanupInterval, "5m"))
+	if err != nil {
+		return nil, err
+	}
 
 	// start cleanup stale uploads go-routine.
 	go s.cleanupStaleUploads(ctx, GlobalStaleUploadsCleanupInterval, GlobalStaleUploadsExpiry)
@@ -596,7 +625,7 @@ func (s *erasureSets) StorageInfo(ctx context.Context) (StorageInfo, []error) {
 		storageInfo.Disks = append(storageInfo.Disks, lstorageInfo.Disks...)
 	}
 
-	var errs []error
+	errs := make([]error, 0, len(s.sets)*s.setDriveCount)
 	for i := range s.sets {
 		errs = append(errs, storageInfoErrs[i]...)
 	}
@@ -653,12 +682,12 @@ func (s *erasureSets) Shutdown(ctx context.Context) error {
 		}
 	}
 	select {
-	case _, ok := <-s.disksConnectEvent:
+	case _, ok := <-s.setReconnectEvent:
 		if ok {
-			close(s.disksConnectEvent)
+			close(s.setReconnectEvent)
 		}
 	default:
-		close(s.disksConnectEvent)
+		close(s.setReconnectEvent)
 	}
 	return nil
 }
@@ -1302,6 +1331,12 @@ func (s *erasureSets) HealObject(ctx context.Context, bucket, object, versionID 
 	return s.getHashedSet(object).HealObject(ctx, bucket, object, versionID, opts)
 }
 
+// PutObjectMetadata - replace or add metadata to an existing object/version
+func (s *erasureSets) PutObjectMetadata(ctx context.Context, bucket, object string, opts ObjectOptions) (ObjectInfo, error) {
+	er := s.getHashedSet(object)
+	return er.PutObjectMetadata(ctx, bucket, object, opts)
+}
+
 // PutObjectTags - replace or add tags to an existing object
 func (s *erasureSets) PutObjectTags(ctx context.Context, bucket, object string, tags string, opts ObjectOptions) (ObjectInfo, error) {
 	er := s.getHashedSet(object)
@@ -1347,28 +1382,9 @@ func (s *erasureSets) maintainMRFList() {
 			bucket:    fOp.bucket,
 			object:    fOp.object,
 			versionID: fOp.versionID,
+			opts:      &madmin.HealOpts{Remove: true},
 		}] = fOp.failedSet
 		s.mrfMU.Unlock()
-	}
-}
-
-func toSourceChTimed(t *time.Timer, sourceCh chan healSource, u healSource) {
-	t.Reset(100 * time.Millisecond)
-
-	// No defer, as we don't know which
-	// case will be selected
-
-	select {
-	case sourceCh <- u:
-	case <-t.C:
-		return
-	}
-
-	// We still need to check the return value
-	// of Stop, because t could have fired
-	// between the send on sourceCh and this line.
-	if !t.Stop() {
-		<-t.C
 	}
 }
 
@@ -1378,16 +1394,13 @@ func (s *erasureSets) healMRFRoutine() {
 	// Wait until background heal state is initialized
 	bgSeq := mustGetHealSequence(GlobalContext)
 
-	idler := time.NewTimer(100 * time.Millisecond)
-	defer idler.Stop()
-
-	for e := range s.disksConnectEvent {
+	for setIndex := range s.setReconnectEvent {
 		// Get the list of objects related the er.set
 		// to which the connected disk belongs.
 		var mrfOperations []healSource
 		s.mrfMU.Lock()
 		for k, v := range s.mrfOperations {
-			if v == e.setIndex {
+			if v == setIndex {
 				mrfOperations = append(mrfOperations, k)
 			}
 		}
@@ -1395,12 +1408,24 @@ func (s *erasureSets) healMRFRoutine() {
 
 		// Heal objects
 		for _, u := range mrfOperations {
+			waitForLowHTTPReq(globalHealConfig.IOCount, globalHealConfig.Sleep)
+
 			// Send an object to background heal
-			toSourceChTimed(idler, bgSeq.sourceCh, u)
+			bgSeq.sourceCh <- u
 
 			s.mrfMU.Lock()
 			delete(s.mrfOperations, u)
 			s.mrfMU.Unlock()
 		}
 	}
+}
+
+// TransitionObject - transition object content to target tier.
+func (s *erasureSets) TransitionObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+	return s.getHashedSet(object).TransitionObject(ctx, bucket, object, opts)
+}
+
+// RestoreTransitionedObject - restore transitioned object content locally on this cluster.
+func (s *erasureSets) RestoreTransitionedObject(ctx context.Context, bucket, object string, opts ObjectOptions) error {
+	return s.getHashedSet(object).RestoreTransitionedObject(ctx, bucket, object, opts)
 }
